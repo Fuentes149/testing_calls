@@ -146,18 +146,17 @@ async def download_recording(filename: str):
 async def telnyx_media(websocket: WebSocket):
     await websocket.accept()
     print("📶 WebSocket de Telnyx conectado", flush=True)
-    # Inicializamos variables para los archivos de audio (inbound y outbound)
+    # Inicializamos variables
     wave_files = {"inbound": None, "outbound": None}
+    wave_paths = {"inbound": None, "outbound": None}  # Nuevo: Almacena paths para usar después de close
     try:
         while True:
-            # Agrego print antes de receive para debug
             print("DEBUG: Esperando mensaje...", flush=True)
             msg_text = await websocket.receive_text()
-            # Agrego print raw para debug (antes de json.loads)
             print(f"DEBUG: Mensaje raw recibido: {msg_text[:200]}...", flush=True)
             data = json.loads(msg_text)
             event = data.get("event")
-            print(f"Evento WebSocket recibido: {event} - Sequence: {data.get('sequence_number')} - Stream ID: {data.get('stream_id')}", flush=True)  # Log extendido
+            print(f"Evento WebSocket recibido: {event} - Sequence: {data.get('sequence_number')} - Stream ID: {data.get('stream_id')}", flush=True)
             
             # Opcional: Imprimir JSON completo (descomentar si necesitas más detalles, pero payload es largo)
             # print("Full WS message:", json.dumps(data, indent=2), flush=True)
@@ -166,42 +165,33 @@ async def telnyx_media(websocket: WebSocket):
                 print(f"Evento 'connected' recibido - Versión: {data.get('version')} - Conexión establecida correctamente.", flush=True)
             
             elif event == "start":
-                # Inicio del streaming: abrir archivos .wav para inbound y outbound
                 call_session = data["start"].get("call_session_id", "call")
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 os.makedirs("llamadas", exist_ok=True)
                 for track in ["inbound", "outbound"]:
                     filename = f"{call_session}_{timestamp}_{track}.wav"
                     file_path = os.path.join("llamadas", filename)
-                    # Configurar archivo WAV (1 canal, 16-bit PCM, 8000 Hz)
                     wf = wave.open(file_path, "wb")
                     wf.setnchannels(1)
                     wf.setsampwidth(2)      # 16-bit = 2 bytes
                     wf.setframerate(8000)
                     wave_files[track] = wf
+                    wave_paths[track] = file_path  # Almacena el path aquí, antes de cualquier close
                     print(f"🎬 Iniciando grabación de {track} en {file_path}", flush=True)
-                    print(f"URL de descarga: https://testing-calls.onrender.com/downloads/{filename}", flush=True)  # Log del link para descargar
+                    print(f"URL de descarga: https://testing-calls.onrender.com/downloads/{filename}", flush=True)
             
             elif event == "media":
-                # Telnyx nos envía un fragmento de audio
                 media_data = data["media"]
                 payload = media_data["payload"]  # audio base64
                 track = media_data.get("track")  # "inbound" o "outbound"
                 if track in wave_files and wave_files[track]:
                     try:
-                        # Imprimir detalles del paquete para depuración
                         payload_preview = payload[:20] + "..." if len(payload) > 20 else payload
                         print(f"Paquete de media recibido para {track} - Largo payload base64: {len(payload)} - Preview: {payload_preview}", flush=True)
-                        
-                        # Decodificar de base64 a bytes (u-law PCM)
                         audio_bytes = base64.b64decode(payload)
                         print(f"Decodificado u-law bytes: {len(audio_bytes)}", flush=True)
-                        
-                        # Convertir de µ-law (PCMU) a PCM lineal 16-bit
-                        pcm_bytes = audioop.ulaw2lin(audio_bytes, 2)  # 2 bytes = 16-bit
+                        pcm_bytes = audioop.ulaw2lin(audio_bytes, 2)
                         print(f"Convertido a PCM bytes: {len(pcm_bytes)}", flush=True)
-                        
-                        # Escribir en el archivo WAV correspondiente
                         wave_files[track].writeframes(pcm_bytes)
                         print(f"Bytes escritos en archivo {track}: {len(pcm_bytes)}", flush=True)
                     except base64.binascii.Error as be:
@@ -210,12 +200,11 @@ async def telnyx_media(websocket: WebSocket):
                         print(f"Error en conversión audio para {track}: {str(ae)}", flush=True)
             
             elif event == "stop":
-                # Fin del streaming de audio
                 print(f"⏹ Finalizando stream de audio - Razón: {data.get('stop', {}).get('reason')}", flush=True)
                 break
             
             else:
-                print(f"Evento WebSocket desconocido: {event} - Datos: {json.dumps(data)}", flush=True)  # Log para eventos inesperados
+                print(f"Evento WebSocket desconocido: {event} - Datos: {json.dumps(data)}", flush=True)
 
     except WebSocketDisconnect as wsd:
         print(f"WebSocket desconectado: Código {wsd.code}, Razón {wsd.reason}", flush=True)
@@ -225,12 +214,12 @@ async def telnyx_media(websocket: WebSocket):
         # Cerrar archivos WAV y WebSocket
         for track, wf in wave_files.items():
             if wf:
-                wf.close()
-                file_path = wf._file.name  # FIX: Usa wf._file.name (da el path completo)
-                file_size = os.path.getsize(file_path)  # Tamaño en bytes
+                file_path = wave_paths[track]  # Usa el path almacenado (antes de close)
+                wf.close()  # Cierra primero
+                file_size = os.path.getsize(file_path)  # Ahora sí, con path válido
                 status = "con audio" if file_size > 0 else "vacío - ¡posible problema!"
-                print(f"Archivo {track} cerrado: {file_path} - Tamaño: {file_size} bytes ({status})", flush=True)  # Confirmación extendida
-                print(f"URL de descarga: https://testing-calls.onrender.com/downloads/{os.path.basename(file_path)}", flush=True)  # Log del link
+                print(f"Archivo {track} cerrado: {file_path} - Tamaño: {file_size} bytes ({status})", flush=True)
+                print(f"URL de descarga: https://testing-calls.onrender.com/downloads/{os.path.basename(file_path)}", flush=True)
         await websocket.close()
         print("Conexión WebSocket cerrada", flush=True)
 
