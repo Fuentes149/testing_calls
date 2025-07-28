@@ -145,13 +145,13 @@ async def download_recording(filename: str):
 @app.websocket("/telnyx-media")
 async def telnyx_media(websocket: WebSocket):
     await websocket.accept()
-    print("📶 WebSocket de Telnyx conectado", flush=True)
+    print("📶 WebSocket aceptado - Esperando handshake completo...", flush=True)
     # Inicializamos variables
     wave_files = {"inbound": None, "outbound": None}
     wave_paths = {"inbound": None, "outbound": None}  # Nuevo: Almacena paths para usar después de close
     try:
         while True:
-            print("DEBUG: Esperando mensaje...", flush=True)
+            print("DEBUG: En loop, esperando mensaje...", flush=True)
             msg_text = await websocket.receive_text()
             print(f"DEBUG: Mensaje raw recibido: {msg_text[:200]}...", flush=True)
             data = json.loads(msg_text)
@@ -224,13 +224,11 @@ async def telnyx_media(websocket: WebSocket):
         # Cerrar WebSocket con manejo de error (FIX: Evita double close)
         try:
             await websocket.close()
-        except RuntimeError as re:
-            print(f"DEBUG: Ignorando error de cierre doble: {str(re)}", flush=True)  # Opcional: Log para debug
         except Exception as e:
-            print(f"Error inesperado al cerrar WS: {str(e)}", flush=True)
+            print(f"Ignorando error al cerrar WS: {str(e)}", flush=True)
         
         print("Conexión WebSocket cerrada", flush=True)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))  # Usa $PORT en Render, fallback a 5000 local
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, ws="wsproto")
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, ws="websockets")
