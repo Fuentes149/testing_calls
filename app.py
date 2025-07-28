@@ -3,7 +3,8 @@ import json
 import requests
 from datetime import datetime
 
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, FileResponse
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse  # Corrección: Importar FileResponse desde fastapi.responses
 import uvicorn
 from dotenv import load_dotenv
 import os
