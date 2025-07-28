@@ -3,19 +3,20 @@ import json
 import requests
 from datetime import datetime
 
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, FileResponse
 import uvicorn
 from dotenv import load_dotenv
 import os
 import wave
 import audioop
+from pathlib import Path
 
 # Carga variables de entorno
 load_dotenv()
 TELNYX_API_KEY = os.getenv("TELNYX_API_KEY")
 TELNYX_CONNECTION_ID = os.getenv("TELNYX_CONNECTION_ID")
 TELNYX_FROM_NUMBER = os.getenv("TELNYX_FROM_NUMBER")
-# Asegúrate de configurar STREAM_URL en .env como wss://plumbing-shapes-cambridge-half.trycloudflare.com/telnyx-media
+# Asegúrate de configurar STREAM_URL en .env como wss://tu-app.onrender.com/telnyx-media
 STREAM_URL = os.getenv("STREAM_URL")  # Debe incluir el path /telnyx-media y usar wss://
 
 if not STREAM_URL:
@@ -118,6 +119,21 @@ async def make_outbound_call(request: Request):
         print(f"Excepción en outbound: {str(ex)}")
         raise
 
+@app.get("/list-recordings")
+async def list_recordings():
+    directory = Path("llamadas")
+    files = [f.name for f in directory.iterdir() if f.is_file()]
+    if not files:
+        return {"message": "No hay grabaciones disponibles"}
+    return {"files": files}
+
+@app.get("/downloads/{filename}")
+async def download_recording(filename: str):
+    file_path = Path("llamadas") / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    return FileResponse(file_path, media_type="audio/wav", filename=filename)
+
 @app.websocket("/telnyx-media")
 async def telnyx_media(websocket: WebSocket):
     await websocket.accept()
@@ -132,10 +148,7 @@ async def telnyx_media(websocket: WebSocket):
             event = data.get("event")
             print(f"Evento WebSocket recibido: {event}")  # Log para depuración
             
-            if event == "connected":
-                print("Stream WebSocket conectado exitosamente")
-            
-            elif event == "start":
+            if event == "start":
                 # Inicio del streaming: abrir archivos .wav para inbound y outbound
                 call_session = data["start"].get("call_session_id", "call")
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -150,6 +163,7 @@ async def telnyx_media(websocket: WebSocket):
                     wf.setframerate(8000)
                     wave_files[track] = wf
                     print(f"🎬 Iniciando grabación de {track} en {file_path}")
+                    print(f"URL de descarga: https://testing-calls.onrender.com/downloads/{filename}")  # Log del link para descargar
             
             elif event == "media":
                 # Telnyx nos envía un fragmento de audio
@@ -163,7 +177,7 @@ async def telnyx_media(websocket: WebSocket):
                     pcm_bytes = audioop.ulaw2lin(audio_bytes, 2)  # 2 bytes = 16-bit
                     # Escribir en el archivo WAV correspondiente
                     wave_files[track].writeframes(pcm_bytes)
-                    print(f"Fragmento de media recibido para {track}")  # Log para depuración
+                    print(f"Fragmento de media recibido para {track} - Bytes escritos: {len(pcm_bytes)}")  # Log de bytes para confirmar grabación
             
             elif event == "stop":
                 # Fin del streaming de audio
@@ -175,12 +189,16 @@ async def telnyx_media(websocket: WebSocket):
         print(f"Error en WebSocket: {ex}")
     finally:
         # Cerrar archivos WAV y WebSocket
-        for wf in wave_files.values():
+        for track, wf in wave_files.items():
             if wf:
                 wf.close()
+                file_path = wf.getname()  # Obtiene el path del archivo
+                file_size = os.path.getsize(file_path)  # Tamaño en bytes
+                print(f"Archivo {track} cerrado: {file_path} - Tamaño: {file_size} bytes")  # Confirmación en logs
+                print(f"URL de descarga: https://testing-calls.onrender.com/downloads/{os.path.basename(file_path)}")  # Log del link
         await websocket.close()
         print("Conexión WebSocket cerrada")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))  # Usa $PORT en Render, fallback a 5000 local
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, ws="wsproto")  # reload=False para producción
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, ws="wsproto")
