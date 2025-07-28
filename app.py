@@ -182,4 +182,5 @@ async def telnyx_media(websocket: WebSocket):
         print("Conexión WebSocket cerrada")
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True, ws="wsproto")
+    port = int(os.environ.get("PORT", 5000))  # Usa $PORT en Render, fallback a 5000 local
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, ws="wsproto")  # reload=False para producción

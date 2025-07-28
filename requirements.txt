@@ -1,4 +1,4 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-python-dotenv==1.0.1
-requests==2.32.3
+fastapi
+uvicorn[standard]  # Esto instala uvicorn + websockets + wsproto para soporte WS
+python-dotenv
+requests
