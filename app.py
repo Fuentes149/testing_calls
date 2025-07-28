@@ -4,7 +4,7 @@ import requests
 from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse  # Corrección: Importar desde fastapi.responses
+from fastapi.responses import FileResponse
 import uvicorn
 from dotenv import load_dotenv
 import os
@@ -51,7 +51,7 @@ async def telnyx_webhook(request: Request):
     p = e["payload"]
     cid = p.get("call_control_id")
     direction = p.get("direction", "unknown")
-    print(f"Evento recibido: {e['event_type']} - Dirección: {direction}")
+    print(f"Evento recibido: {e['event_type']} - Dirección: {direction} - Call ID: {cid}")
 
     if e["event_type"] == "call.initiated":
         if direction == "incoming":  # Para inbound (incoming)
@@ -96,7 +96,10 @@ async def telnyx_webhook(request: Request):
             print(f"Error al streaming_stop: {str(ex)}")  # Podría fallar si no inició o ya terminó
 
     elif e["event_type"] == "streaming.failed":
-        print(f"Streaming failed: Razón - {p.get('failure_reason')}, URL - {p.get('stream_params', {}).get('stream_url')}")  # Log detalles para depuración
+        print(f"Streaming failed: Razón - {p.get('failure_reason')}, URL - {p.get('stream_params', {}).get('stream_url')} - Detalles completos: {json.dumps(p, indent=2)}")  # Log detalles extendidos para depuración
+
+    else:
+        print(f"Evento desconocido recibido: {e['event_type']} - Payload: {json.dumps(p, indent=2)}")  # Log para eventos no manejados
 
     return {"status": "OK"}
 
@@ -128,6 +131,7 @@ async def list_recordings():
     files = [f.name for f in directory.iterdir() if f.is_file()]
     if not files:
         return {"message": "No hay grabaciones disponibles"}
+    print(f"Listando grabaciones: {files}")  # Log para depuración
     return {"files": files}
 
 @app.get("/downloads/{filename}")
@@ -135,6 +139,7 @@ async def download_recording(filename: str):
     file_path = Path("llamadas") / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    print(f"Descargando archivo: {filename}")  # Log para depuración
     return FileResponse(file_path, media_type="audio/wav", filename=filename)
 
 @app.websocket("/telnyx-media")
@@ -149,9 +154,15 @@ async def telnyx_media(websocket: WebSocket):
             msg_text = await websocket.receive_text()
             data = json.loads(msg_text)
             event = data.get("event")
-            print(f"Evento WebSocket recibido: {event}")  # Log para depuración
+            print(f"Evento WebSocket recibido: {event} - Sequence: {data.get('sequence_number')} - Stream ID: {data.get('stream_id')}")  # Log extendido
             
-            if event == "start":
+            # Opcional: Imprimir JSON completo (descomentar si necesitas más detalles, pero payload es largo)
+            # print("Full WS message:", json.dumps(data, indent=2))
+            
+            if event == "connected":
+                print("Evento 'connected' recibido - Versión: {data.get('version')} - Conexión establecida correctamente.")
+            
+            elif event == "start":
                 # Inicio del streaming: abrir archivos .wav para inbound y outbound
                 call_session = data["start"].get("call_session_id", "call")
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -174,18 +185,35 @@ async def telnyx_media(websocket: WebSocket):
                 payload = media_data["payload"]  # audio base64
                 track = media_data.get("track")  # "inbound" o "outbound"
                 if track in wave_files and wave_files[track]:
-                    # Decodificar de base64 a bytes (u-law PCM)
-                    audio_bytes = base64.b64decode(payload)
-                    # Convertir de µ-law (PCMU) a PCM lineal 16-bit
-                    pcm_bytes = audioop.ulaw2lin(audio_bytes, 2)  # 2 bytes = 16-bit
-                    # Escribir en el archivo WAV correspondiente
-                    wave_files[track].writeframes(pcm_bytes)
-                    print(f"Fragmento de media recibido para {track} - Bytes escritos: {len(pcm_bytes)}")  # Log de bytes para confirmar grabación
+                    try:
+                        # Imprimir detalles del paquete para depuración
+                        payload_preview = payload[:20] + "..." if len(payload) > 20 else payload
+                        print(f"Paquete de media recibido para {track} - Largo payload base64: {len(payload)} - Preview: {payload_preview}")
+                        
+                        # Decodificar de base64 a bytes (u-law PCM)
+                        audio_bytes = base64.b64decode(payload)
+                        print(f"Decodificado u-law bytes: {len(audio_bytes)}")
+                        
+                        # Convertir de µ-law (PCMU) a PCM lineal 16-bit
+                        pcm_bytes = audioop.ulaw2lin(audio_bytes, 2)  # 2 bytes = 16-bit
+                        print(f"Convertido a PCM bytes: {len(pcm_bytes)}")
+                        
+                        # Escribir en el archivo WAV correspondiente
+                        wave_files[track].writeframes(pcm_bytes)
+                        print(f"Bytes escritos en archivo {track}: {len(pcm_bytes)}")
+                    except base64.binascii.Error as be:
+                        print(f"Error en decodificación base64 para {track}: {str(be)} - Payload inválido?")
+                    except Exception as ae:
+                        print(f"Error en conversión audio para {track}: {str(ae)}")
             
             elif event == "stop":
                 # Fin del streaming de audio
-                print("⏹ Finalizando stream de audio")
+                print("⏹ Finalizando stream de audio - Razón: {data.get('stop', {}).get('reason')}")
                 break
+            
+            else:
+                print(f"Evento WebSocket desconocido: {event} - Datos: {json.dumps(data)}")  # Log para eventos inesperados
+
     except WebSocketDisconnect as wsd:
         print(f"WebSocket desconectado: Código {wsd.code}, Razón {wsd.reason}")
     except Exception as ex:
@@ -197,7 +225,8 @@ async def telnyx_media(websocket: WebSocket):
                 wf.close()
                 file_path = wf.getname()  # Obtiene el path del archivo
                 file_size = os.path.getsize(file_path)  # Tamaño en bytes
-                print(f"Archivo {track} cerrado: {file_path} - Tamaño: {file_size} bytes")  # Confirmación en logs
+                status = "con audio" if file_size > 0 else "vacío - ¡posible problema!"
+                print(f"Archivo {track} cerrado: {file_path} - Tamaño: {file_size} bytes ({status})")  # Confirmación extendida
                 print(f"URL de descarga: https://testing-calls.onrender.com/downloads/{os.path.basename(file_path)}")  # Log del link
         await websocket.close()
         print("Conexión WebSocket cerrada")
