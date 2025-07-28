@@ -123,10 +123,15 @@ async def make_outbound_call(request: Request):
 @app.get("/list-recordings")
 async def list_recordings():
     directory = Path("llamadas")
-    files = [f.name for f in directory.iterdir() if f.is_file()]
-    if not files:
-        return {"message": "No hay grabaciones disponibles"}
-    return {"files": files}
+    if not directory.exists():
+        return {"message": "No hay grabaciones disponibles (directorio no creado aún)"}
+    try:
+        files = [f.name for f in directory.iterdir() if f.is_file()]
+        if not files:
+            return {"message": "No hay grabaciones disponibles"}
+        return {"files": files}
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=f"Error al listar archivos: {str(ex)}")
 
 @app.get("/downloads/{filename}")
 async def download_recording(filename: str):
