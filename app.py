@@ -211,16 +211,24 @@ async def telnyx_media(websocket: WebSocket):
     except Exception as ex:
         print(f"Error en WebSocket: {ex}", flush=True)
     finally:
-        # Cerrar archivos WAV y WebSocket
+        # Cerrar archivos WAV
         for track, wf in wave_files.items():
             if wf:
-                file_path = wave_paths[track]  # Usa el path almacenado (antes de close)
-                wf.close()  # Cierra primero
-                file_size = os.path.getsize(file_path)  # Ahora sí, con path válido
+                file_path = wave_paths[track]
+                wf.close()
+                file_size = os.path.getsize(file_path)
                 status = "con audio" if file_size > 0 else "vacío - ¡posible problema!"
                 print(f"Archivo {track} cerrado: {file_path} - Tamaño: {file_size} bytes ({status})", flush=True)
                 print(f"URL de descarga: https://testing-calls.onrender.com/downloads/{os.path.basename(file_path)}", flush=True)
-        await websocket.close()
+        
+        # Cerrar WebSocket con manejo de error (FIX: Evita double close)
+        try:
+            await websocket.close()
+        except RuntimeError as re:
+            print(f"DEBUG: Ignorando error de cierre doble: {str(re)}", flush=True)  # Opcional: Log para debug
+        except Exception as e:
+            print(f"Error inesperado al cerrar WS: {str(e)}", flush=True)
+        
         print("Conexión WebSocket cerrada", flush=True)
 
 if __name__ == "__main__":
