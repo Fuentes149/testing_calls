@@ -81,7 +81,7 @@ curl -Method POST http://localhost:5000/make_outbound_call `
 
 ### Recibir llamada entrante
 
-1. Llama al número asociado a tu **Telnyx Connection**.
+1. Llama al número +56-2-3236-6719
 2. El bot responderá automáticamente y transmitirá el audio a OpenAI en tiempo real.
 
 ---
