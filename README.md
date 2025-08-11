@@ -50,7 +50,8 @@ BASE_URL=http://abcd1234.ngrok.io
 En la **Consola de Telnyx**, en la sección de tu **Realtime Comunication** luego a **Voice** y despues a **Programmable Voice**, agrega el webhook como se muestra en la imgaen:
 
 ```
-![Flujo de llamada](image.png)
+![Flujo de llamada](./image.png)
+
 
 ```
 
