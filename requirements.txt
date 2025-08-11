@@ -1,0 +1,6 @@
+fastapi==0.112.0  # O la última
+uvicorn==0.30.3  # O la última (el fix para el bug está desde 0.23.0)
+websockets==12.0  # Backend alternativo para WS, más estable para conexiones reales
+python-dotenv==1.0.1
+requests==2.32.3
+# Mantén las otras como wave, audioop (estándar en Python), etc.
