@@ -1,6 +1,6 @@
 # app.py
-# FastAPI + Telnyx Call Control + Gemini Realtime (sin guardar grabaciones)
-# Requiere: fastapi, uvicorn, websockets, requests, numpy, scipy, python-dotenv
+# FastAPI + Telnyx Call Control + Gemini Realtime (SIN guardar audios, SIN SciPy)
+# Requisitos: fastapi, uvicorn[standard], websockets, requests, numpy, python-dotenv
 
 import os
 import json
@@ -12,7 +12,6 @@ from datetime import datetime
 import requests
 import numpy as np
 import audioop
-import scipy.signal as signal
 import asyncio
 import websockets
 
@@ -53,8 +52,40 @@ if missing:
 def get_stream_url() -> str:
     """Convierte BASE_URL https -> wss para el websocket /media."""
     if not BASE_URL or not BASE_URL.startswith("https://"):
-        raise HTTPException(status_code=500, detail="BASE_URL no está configurado correctamente (debe ser https://...)")
+        raise HTTPException(status_code=500, detail="BASE_URL debe ser https://... (ej. https://mi-dominio)")
     return BASE_URL.replace("https://", "wss://") + "/media"
+
+
+# ------------------------
+# Utilidades de audio (sin SciPy)
+# ------------------------
+def downsample_24k_to_8k(pcm24_bytes: bytes) -> bytes:
+    """Baja de 24 kHz a 8 kHz por decimación x3 (simple y rápido)."""
+    x = np.frombuffer(pcm24_bytes, dtype=np.int16)
+    if x.size == 0:
+        return b""
+    y = x[::3]  # toma 1 de cada 3 muestras
+    return y.astype(np.int16).tobytes()
+
+def upsample_8k_to_16k_linear(pcm8_bytes: bytes) -> bytes:
+    """Sube de 8 kHz a 16 kHz por interpolación lineal x2."""
+    x = np.frombuffer(pcm8_bytes, dtype=np.int16)
+    n = x.size
+    if n == 0:
+        return b""
+    if n == 1:
+        # duplica la única muestra
+        y = np.repeat(x, 2)
+        return y.astype(np.int16).tobytes()
+
+    y = np.empty(n * 2, dtype=np.int16)
+    y[0::2] = x  # índices pares = originales
+    # índices impares = promedio de vecinos
+    mid = (x[:-1].astype(np.int32) + x[1:].astype(np.int32)) // 2
+    y[1:-1:2] = mid.astype(np.int16)
+    y[-1] = x[-1]  # último impar replica el último valor
+    return y.tobytes()
+
 
 # ------------------------
 # Latencia helpers
@@ -111,14 +142,16 @@ def log_turn_metrics(sid, lat):
     ]
     logging.info(" ".join(parts))
 
+
 # ------------------------
-# App state
+# App & estado en memoria
 # ------------------------
 app = FastAPI()
 sessions = {}  # sid -> {codec, gemini_ws, telnyx_ws, audio_buffer_out, latency}
 
+
 # ------------------------
-# Utilidades Telnyx
+# Telnyx helpers
 # ------------------------
 def telnyx_action(call_id: str, action: str, data: dict = None):
     try:
@@ -134,12 +167,14 @@ def telnyx_action(call_id: str, action: str, data: dict = None):
         logging.exception(f"Excepción al enviar comando '{action}': {str(ex)}")
         raise
 
+
 # ------------------------
 # Healthcheck
 # ------------------------
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "time": datetime.utcnow().isoformat()}
+
 
 # ------------------------
 # Webhook Telnyx
@@ -183,6 +218,7 @@ async def telnyx_webhook(request: Request):
             sessions.pop(sid, None)
 
     return {"status": "OK"}
+
 
 # ------------------------
 # Click-to-call (outbound)
@@ -231,22 +267,23 @@ async def make_outbound_call(request: Request):
         logging.exception(f"Excepción en outbound: {str(ex)}")
         raise
 
+
 # ------------------------
-# Cierre de sesión (sin guardar archivos)
+# Cierre de sesión (sin archivos)
 # ------------------------
 async def close_session(sid):
     sess = sessions.get(sid)
     if not sess:
         return
-    # Cierra WS Gemini si está abierto
     if sess.get("gemini_ws"):
         try:
             await sess["gemini_ws"].close()
         except Exception:
             pass
 
+
 # ------------------------
-# Recepción desde Gemini -> Telnyx
+# Recibir desde Gemini -> enviar a Telnyx
 # ------------------------
 async def receive_from_gemini(sid):
     sess = sessions[sid]
@@ -273,7 +310,7 @@ async def receive_from_gemini(sid):
             except KeyError:
                 pass
 
-            # 2) Audio del modelo
+            # 2) Audio del modelo (24k PCM16 mono)
             try:
                 audio_b64 = data["serverContent"]["modelTurn"]["parts"][0]["inlineData"]["data"]
                 audio_delta = base64.b64decode(audio_b64)
@@ -289,27 +326,22 @@ async def receive_from_gemini(sid):
 
                     sess["audio_buffer_out"] += audio_delta
 
-                    # Entrada viene a 24k PCM16 mono. Procesamos en chunks de 20 ms (960 bytes)
+                    # Procesar en chunks de 20ms @24k (960 bytes)
                     chunk_size = 960
                     while len(sess["audio_buffer_out"]) >= chunk_size:
                         pcm24k = sess["audio_buffer_out"][:chunk_size]
                         sess["audio_buffer_out"] = sess["audio_buffer_out"][chunk_size:]
 
-                        # LPF y downsample 24k -> 8k (Telnyx PCMA/PCMU)
-                        b, a = signal.butter(4, 3900 / (24000 / 2), btype='low')
-                        pcm24k_np = np.frombuffer(pcm24k, dtype=np.int16).astype(np.float32)
-                        filtered_np = signal.filtfilt(b, a, pcm24k_np) if len(pcm24k_np) > 14 else pcm24k_np
-                        pcm24k_filtered = filtered_np.astype(np.int16)
+                        # Downsample 24k -> 8k (simple decimación)
+                        pcm8k = downsample_24k_to_8k(pcm24k)
 
-                        pcm8k_np = signal.resample(pcm24k_filtered, int(len(pcm24k_filtered) * 8000 / 24000))
-                        pcm8k = pcm8k_np.astype(np.int16).tobytes()
-
+                        # Codificar a PCMA/PCMU para Telnyx
                         if codec == "PCMA":
                             encoded = audioop.lin2alaw(pcm8k, 2)
                         elif codec == "PCMU":
                             encoded = audioop.lin2ulaw(pcm8k, 2)
                         else:
-                            continue  # otros codecs no manejados en este ejemplo
+                            continue
 
                         media_event = {
                             "event": "media",
@@ -337,6 +369,7 @@ async def receive_from_gemini(sid):
 
     except Exception as ex:
         logging.exception(f"Error recibiendo de Gemini: {str(ex)}")
+
 
 # ------------------------
 # WebSocket bidireccional con Telnyx
@@ -386,11 +419,7 @@ async def handle_media_stream(websocket: WebSocket):
                             "model": GEMINI_MODEL,
                             "generationConfig": {
                                 "responseModalities": ["AUDIO"],
-                                "speechConfig": {
-                                    "voiceConfig": {
-                                        "prebuiltVoiceConfig": {"voiceName": "Puck"}
-                                    }
-                                }
+                                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Puck"}}}
                             },
                             "systemInstruction": {"parts": [{"text": system_prompt}]},
                             "realtimeInputConfig": {"automaticActivityDetection": {"disabled": False}}
@@ -449,13 +478,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 logging.debug(f"[VAD] USER_END sid={sid} utt={lat['utt_id']} "
                                               f"user_speech_ms={ms(lat['user_end_ts'] - lat['user_start_ts'])}")
 
-                    # LPF + upsample 8k -> 16k para Gemini
-                    pcm8k_np = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-                    b, a = signal.butter(4, 3900 / (8000 / 2), btype='low')
-                    filtered_np = signal.filtfilt(b, a, pcm8k_np) if len(pcm8k_np) > 14 else pcm8k_np
-                    pcm8k_filtered = filtered_np.astype(np.int16)
-                    pcm16k_np = signal.resample(pcm8k_filtered, int(len(pcm8k_filtered) * 16000 / 8000))
-                    pcm16k = pcm16k_np.astype(np.int16).tobytes()
+                    # 8k -> 16k para Gemini (interpolación x2)
+                    pcm16k = upsample_8k_to_16k_linear(pcm)
 
                     if gemini_ws:
                         append_event = {
@@ -467,7 +491,6 @@ async def handle_media_stream(websocket: WebSocket):
                             }
                         }
                         await gemini_ws.send(json.dumps(append_event))
-
                 else:
                     # Otros codecs no manejados
                     pass
@@ -489,12 +512,12 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception:
             pass
 
+
 # ------------------------
 # Main
 # ------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    # No uses --reload en Cloud Run. Para local, exporta RELOAD=1 si quieres.
-    reload = os.getenv("RELOAD", "0") == "1"
+    reload = os.getenv("RELOAD", "0") == "1"  # para pruebas locales
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=port, log_level="info", reload=reload)
