@@ -15,8 +15,11 @@ REQUISITOS DE ENTORNO (.env):
   VAD_SILENCE_MS=500
   LOG_LEVEL=INFO
 
-EJECUCIÓN:
-  uvicorn app:app --host 0.0.0.0 --port 5000 --reload
+EJECUCIÓN LOCAL:
+  # Linux/Mac
+  PORT=8080 UVICORN_RELOAD=true python app.py
+  # PowerShell
+  $env:PORT="8080"; $env:UVICORN_RELOAD="true"; python app.py
 
 WEBHOOK:
   POST https://TU-DOMINIO/telnyx-webhook
@@ -53,8 +56,8 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-native-audio-
 GEMINI_ASSISTANT_GREETING = os.getenv("GEMINI_ASSISTANT_GREETING", "¡Hola! ¿En qué puedo ayudarte?")
 NATIVE_SYSTEM_PROMPT = os.getenv("NATIVE_SYSTEM_PROMPT", "Eres un agente de soporte útil. Responde en español.")
 
-VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "500"))   # Umbral de energía (ajústalo a tu audio real)
-VAD_SILENCE_MS = int(os.getenv("VAD_SILENCE_MS", "500"))         # ms de silencio para marcar fin de habla
+VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "500"))   # Umbral de energía
+VAD_SILENCE_MS = int(os.getenv("VAD_SILENCE_MS", "500"))         # ms de silencio para fin de habla
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
@@ -62,15 +65,32 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
+# No abortamos el proceso si faltan env vars: lo registramos y validamos en tiempo de uso.
 if not BASE_URL:
-    raise ValueError("BASE_URL no está configurado en las variables de entorno")
+    logging.warning("BASE_URL no está configurado. Las rutas que construyen STREAM_URL fallarán si se invocan.")
 if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY no está configurado en las variables de entorno")
-
-STREAM_URL = BASE_URL.replace("https://", "wss://") + "/media"
+    logging.error("GEMINI_API_KEY no está configurado. No se podrá conectar a Gemini hasta que lo definas.")
 
 app = FastAPI()
 sessions = {}
+
+# ------------------------
+# Utilidades
+# ------------------------
+def get_stream_url() -> str:
+    """Construye la URL de WebSocket (wss) para /media a partir de BASE_URL."""
+    base = os.getenv("BASE_URL")
+    if not base:
+        # Error en tiempo de uso en lugar de crash al boot
+        raise HTTPException(status_code=500, detail="Falta BASE_URL en el entorno del servicio")
+    base = base.rstrip("/")
+    if base.startswith("https://"):
+        return base.replace("https://", "wss://") + "/media"
+    elif base.startswith("http://"):
+        return base.replace("http://", "ws://") + "/media"
+    else:
+        # Por defecto asume https→wss
+        return "wss://" + base + "/media"
 
 # ------------------------
 # Utilidades Latencia
@@ -146,6 +166,8 @@ def reset_for_next_turn(lat):
 # ------------------------
 def api(call_id: str, action: str, data: dict = None):
     try:
+        if not TELNYX_API_KEY:
+            raise HTTPException(status_code=500, detail="Falta TELNYX_API_KEY en el entorno")
         resp = requests.post(
             f"https://api.telnyx.com/v2/calls/{call_id}/actions/{action}",
             headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
@@ -157,6 +179,17 @@ def api(call_id: str, action: str, data: dict = None):
     except Exception as ex:
         logging.exception(f"Excepción al enviar comando '{action}': {str(ex)}")
         raise
+
+# ------------------------
+# Health / Readiness
+# ------------------------
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+@app.get("/healthz")
+def health():
+    return {"ok": True}
 
 # ------------------------
 # Webhook Telnyx
@@ -183,7 +216,7 @@ async def telnyx_webhook(request: Request):
                 state = base64.b64encode(b"init").decode()
                 answer_data = {
                     "client_state": state,
-                    "stream_url": STREAM_URL,
+                    "stream_url": get_stream_url(),
                     "stream_track": "both_tracks",
                     "stream_bidirectional_mode": "rtp",
                     "stream_bidirectional_codec": "PCMA"
@@ -211,13 +244,15 @@ async def make_outbound_call(request: Request):
     if not to_number:
         raise HTTPException(status_code=400, detail="Falta 'to'")
     try:
+        if not TELNYX_CONNECTION_ID or not TELNYX_FROM_NUMBER or not TELNYX_API_KEY:
+            raise HTTPException(status_code=500, detail="Faltan variables TELNYX_* en el entorno")
         state = base64.b64encode(b"init").decode()
         call_data = {
             "connection_id": TELNYX_CONNECTION_ID,
             "to": to_number,
             "from": TELNYX_FROM_NUMBER,
             "client_state": state,
-            "stream_url": STREAM_URL,
+            "stream_url": get_stream_url(),
             "stream_track": "both_tracks",
             "stream_bidirectional_mode": "rtp",
             "stream_bidirectional_codec": "PCMA"
@@ -388,53 +423,56 @@ async def handle_media_stream(websocket: WebSocket):
                     sessions[sid]["codec"] = codec
                     sessions[sid]["telnyx_ws"] = websocket
 
-                    # Conectar a Gemini Realtime API
-                    uri = (
-                        "wss://generativelanguage.googleapis.com/ws/"
-                        "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-                        f"?key={GEMINI_API_KEY}"
-                    )
-                    try:
-                        gemini_ws = await websockets.connect(uri, max_size=None)
-                        sessions[sid]["gemini_ws"] = gemini_ws
-                        logging.info(f"[WS] Gemini conectado sid={sid}")
-                    except Exception as ex:
-                        logging.exception(f"Error conectando a Gemini: {str(ex)}")
-                        continue
+                    # Conectar a Gemini Realtime API (si hay API key)
+                    if not GEMINI_API_KEY:
+                        logging.error("[WS] GEMINI_API_KEY ausente: no se puede conectar a Gemini.")
+                    else:
+                        uri = (
+                            "wss://generativelanguage.googleapis.com/ws/"
+                            "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+                            f"?key={GEMINI_API_KEY}"
+                        )
+                        try:
+                            gemini_ws = await websockets.connect(uri, max_size=None)
+                            sessions[sid]["gemini_ws"] = gemini_ws
+                            logging.info(f"[WS] Gemini conectado sid={sid}")
+                        except Exception as ex:
+                            logging.exception(f"Error conectando a Gemini: {str(ex)}")
 
                     # Configurar sesión en Gemini (AAD activado con defaults seguros)
-                    system_prompt = (
-                        NATIVE_SYSTEM_PROMPT
-                        + f"\nCuando el usuario diga '___start___', responde exactamente: '{GEMINI_ASSISTANT_GREETING}' y espera su consulta."
-                    )
-                    setup_event = {
-                        "setup": {
-                            "model": GEMINI_MODEL,
-                            "generationConfig": {
-                                "responseModalities": ["AUDIO"],
-                                "speechConfig": {
-                                    "voiceConfig": {
-                                        "prebuiltVoiceConfig": {"voiceName": "Puck"}
+                    if sessions[sid].get("gemini_ws"):
+                        system_prompt = (
+                            NATIVE_SYSTEM_PROMPT
+                            + f"\nCuando el usuario diga '___start___', responde exactamente: '{GEMINI_ASSISTANT_GREETING}' y espera su consulta."
+                        )
+                        setup_event = {
+                            "setup": {
+                                "model": GEMINI_MODEL,
+                                "generationConfig": {
+                                    "responseModalities": ["AUDIO"],
+                                    "speechConfig": {
+                                        "voiceConfig": {
+                                            "prebuiltVoiceConfig": {"voiceName": "Puck"}
+                                        }
                                     }
-                                }
-                            },
-                            "systemInstruction": {"parts": [{"text": system_prompt}]},
-                            "realtimeInputConfig": {
-                                "automaticActivityDetection": {
-                                    "disabled": False
+                                },
+                                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                                "realtimeInputConfig": {
+                                    "automaticActivityDetection": {
+                                        "disabled": False
+                                    }
                                 }
                             }
                         }
-                    }
-                    await gemini_ws.send(json.dumps(setup_event))
-                    await gemini_ws.recv()  # Esperar ACK
+                        await sessions[sid]["gemini_ws"].send(json.dumps(setup_event))
+                        await sessions[sid]["gemini_ws"].recv()  # Esperar ACK
 
-                    # Trigger saludo inicial
-                    initial_input = {"realtime_input": {"text": "___start___"}}
-                    await gemini_ws.send(json.dumps(initial_input))
+                        # Trigger saludo inicial
+                        initial_input = {"realtime_input": {"text": "___start___"}}
+                        await sessions[sid]["gemini_ws"].send(json.dumps(initial_input))
 
-                    # Iniciar tarea de recepción de Gemini
-                    gemini_task = asyncio.create_task(receive_from_gemini(sid))
+                        # Iniciar tarea de recepción de Gemini
+                        gemini_task = asyncio.create_task(receive_from_gemini(sid))
                     logging.info(f"[Telnyx WS] start sid={sid} codec={codec}")
 
             elif evt == "media" and sid in sessions:
@@ -461,13 +499,13 @@ async def handle_media_stream(websocket: WebSocket):
                     # VAD: detección de inicio/fin de habla
                     # --------------------
                     rms = audioop.rms(pcm, 2)  # energía
-                    now = now_monotonic()
+                    now_t = now_monotonic()
 
                     if rms >= VAD_RMS_THRESHOLD:
                         if not lat["user_in_speech"]:
                             lat["utt_id"] += 1
                             lat["user_in_speech"] = True
-                            lat["user_start_ts"] = now
+                            lat["user_start_ts"] = now_t
                             lat["user_end_ts"] = None
                             lat["awaiting_model"] = False
                             lat["model_first_audio_ts"] = None
@@ -475,10 +513,10 @@ async def handle_media_stream(websocket: WebSocket):
                             lat["model_in_progress"] = False
                             lat["interrupted_prev"] = False
                             logging.debug(f"[VAD] USER_START sid={sid} utt={lat['utt_id']}")
-                        lat["last_voice_ts"] = now
+                        lat["last_voice_ts"] = now_t
                     else:
                         if lat["user_in_speech"] and lat["last_voice_ts"]:
-                            if (now - lat["last_voice_ts"]) * 1000.0 >= VAD_SILENCE_MS:
+                            if (now_t - lat["last_voice_ts"]) * 1000.0 >= VAD_SILENCE_MS:
                                 lat["user_in_speech"] = False
                                 lat["user_end_ts"] = lat["last_voice_ts"]
                                 lat["awaiting_model"] = True   # ahora esperamos la 1ª respuesta del modelo
@@ -498,7 +536,7 @@ async def handle_media_stream(websocket: WebSocket):
                     pcm16k_np = signal.resample(pcm8k_filtered, int(len(pcm8k_filtered) * 16000 / 8000))
                     pcm16k = pcm16k_np.astype(np.int16).tobytes()
 
-                    # Enviar a Gemini
+                    # Enviar a Gemini (si hay WS)
                     if gemini_ws:
                         append_event = {
                             "realtime_input": {
@@ -532,18 +570,8 @@ async def handle_media_stream(websocket: WebSocket):
 # ------------------------
 # Main
 # ------------------------
-# ------------------------
-# Main
-# ------------------------
 if __name__ == "__main__":
-    # Cloud Run asigna el puerto mediante la variable de entorno PORT.
-    # Usa 8080 por defecto si no está definido (buena práctica también para App Engine/Flex).
-    port = int(os.getenv("PORT", "8080"))
-
-    # En producción (Cloud Run) no uses reload. Si quieres activarlo localmente:
-    #   Linux/Mac: UVICORN_RELOAD=true python app.py
-    #   PowerShell: $env:UVICORN_RELOAD="true"; python app.py
+    port = int(os.getenv("PORT", "8080"))  # Cloud Run define PORT; 8080 por defecto local
     reload_flag = os.getenv("UVICORN_RELOAD", "false").lower() == "true"
-
-    # Ojo: pasa el objeto 'app' directamente; no el string "app:app".
+    logging.info(f"[BOOT] Iniciando Uvicorn en 0.0.0.0:{port} (reload={reload_flag})")
     uvicorn.run(app, host="0.0.0.0", port=port, reload=reload_flag)
