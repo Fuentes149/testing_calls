@@ -532,6 +532,18 @@ async def handle_media_stream(websocket: WebSocket):
 # ------------------------
 # Main
 # ------------------------
+# ------------------------
+# Main
+# ------------------------
 if __name__ == "__main__":
-    
-    uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True)
+    # Cloud Run asigna el puerto mediante la variable de entorno PORT.
+    # Usa 8080 por defecto si no está definido (buena práctica también para App Engine/Flex).
+    port = int(os.getenv("PORT", "8080"))
+
+    # En producción (Cloud Run) no uses reload. Si quieres activarlo localmente:
+    #   Linux/Mac: UVICORN_RELOAD=true python app.py
+    #   PowerShell: $env:UVICORN_RELOAD="true"; python app.py
+    reload_flag = os.getenv("UVICORN_RELOAD", "false").lower() == "true"
+
+    # Ojo: pasa el objeto 'app' directamente; no el string "app:app".
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=reload_flag)
