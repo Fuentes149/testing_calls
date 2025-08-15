@@ -579,6 +579,7 @@ async def handle_media_stream(websocket: WebSocket):
 
 # ------------------------
 # Main
-# ------------------------
+
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True)
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, log_level="info")
