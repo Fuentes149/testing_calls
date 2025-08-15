@@ -1,3 +1,26 @@
+"""
+app.py — FastAPI + Telnyx Call Control + Asistente de Voz con Gemini con métricas de latencia
+REQUISITOS DE ENTORNO (.env):
+  TELNYX_API_KEY=...
+  TELNYX_CONNECTION_ID=cc-app-xxxxxxxxxxxxxxxxxxxx
+  TELNYX_FROM_NUMBER=+1XXXXXXXXXX
+  GEMINI_API_KEY=...
+  BASE_URL=https://tu-dominio
+  # Config para Gemini:
+  GEMINI_MODEL=gemini-2.5-flash-preview-native-audio-dialog
+  GEMINI_ASSISTANT_GREETING=¡Hola! ¿En qué puedo ayudarte?
+  NATIVE_SYSTEM_PROMPT=Eres un agente de soporte...
+  # (Opcional) Ajustes VAD y logging
+  VAD_RMS_THRESHOLD=500
+  VAD_SILENCE_MS=500
+  LOG_LEVEL=INFO
+EJECUCIÓN:
+  uvicorn app:app --host 0.0.0.0 --port 5000 --reload
+WEBHOOK:
+  POST https://TU-DOMINIO/telnyx-webhook
+Notas: pip install google-generativeai librosa numpy soundfile audioop pydub scipy fastapi uvicorn websockets python-dotenv requests
+"""
+
 import base64
 import json
 import requests
@@ -5,35 +28,124 @@ from datetime import datetime
 import wave
 import audioop
 import os
-from pydub import AudioSegment  # Requiere: pip install pydub y tener ffmpeg instalado en el sistema
+from pydub import AudioSegment
 import asyncio
 import websockets
 import numpy as np
 import scipy.signal as signal
+import time
+import logging
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket
 import uvicorn
 from dotenv import load_dotenv
 
+# ------------------------
+# Config & logging
+# ------------------------
 load_dotenv()
 TELNYX_API_KEY = os.getenv("TELNYX_API_KEY")
 TELNYX_CONNECTION_ID = os.getenv("TELNYX_CONNECTION_ID")
 TELNYX_FROM_NUMBER = os.getenv("TELNYX_FROM_NUMBER")
 BASE_URL = os.getenv("BASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-native-audio-dialog")
+GEMINI_ASSISTANT_GREETING = os.getenv("GEMINI_ASSISTANT_GREETING", "¡Hola! ¿En qué puedo ayudarte?")
+NATIVE_SYSTEM_PROMPT = os.getenv("NATIVE_SYSTEM_PROMPT", "Eres un agente de soporte útil. Responde en español.")
+
+VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "500"))   # Umbral de energía (ajústalo a tu audio real)
+VAD_SILENCE_MS = int(os.getenv("VAD_SILENCE_MS", "500"))         # ms de silencio para marcar fin de habla
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
 if not BASE_URL:
     raise ValueError("BASE_URL no está configurado en las variables de entorno")
-
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY no está configurado en las variables de entorno")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY no está configurado en las variables de entorno")
 
 STREAM_URL = BASE_URL.replace("https://", "wss://") + "/media"
 
 app = FastAPI()
-
 sessions = {}
 
+os.makedirs("llamadas_guardadas", exist_ok=True)
+
+# ------------------------
+# Utilidades Latencia
+# ------------------------
+def now_monotonic():
+    """Reloj monotónico en segundos para medir intervalos con precisión."""
+    return time.perf_counter()
+
+def ms(dt):
+    return round(dt * 1000.0, 1)
+
+def init_latency_tracker():
+    return {
+        "utt_id": 0,                 # contador de turnos (cada vez que el usuario habla)
+        "user_in_speech": False,     # estamos dentro de voz activa del usuario
+        "user_start_ts": None,       # inicio de habla
+        "user_end_ts": None,         # fin de habla (por silencio)
+        "last_voice_ts": None,       # última vez que detectamos energía > umbral
+        "awaiting_model": False,     # esperamos primera respuesta del modelo para este turno
+        "model_first_audio_ts": None,# primer chunk de audio del modelo para este turno
+        "model_end_ts": None,        # fin de la respuesta del modelo (turnComplete)
+        "model_in_progress": False,  # modelo está respondiendo
+        "interrupted_prev": False    # si el modelo anterior fue interrumpido por habla del usuario
+    }
+
+def log_turn_metrics(sid, lat):
+    """Log de métricas cuando termina un turno del modelo, si hay datos suficientes."""
+    if lat["user_start_ts"] and lat["user_end_ts"]:
+        user_speech_ms = ms(lat["user_end_ts"] - lat["user_start_ts"])
+    else:
+        user_speech_ms = None
+
+    if lat["model_first_audio_ts"] and lat["user_end_ts"]:
+        ttfb_ms = ms(lat["model_first_audio_ts"] - lat["user_end_ts"])
+    else:
+        ttfb_ms = None
+
+    if lat["model_end_ts"] and lat["model_first_audio_ts"]:
+        model_speech_ms = ms(lat["model_end_ts"] - lat["model_first_audio_ts"])
+    else:
+        model_speech_ms = None
+
+    if lat["model_end_ts"] and lat["user_end_ts"]:
+        e2e_to_end_ms = ms(lat["model_end_ts"] - lat["user_end_ts"])
+    else:
+        e2e_to_end_ms = None
+
+    parts = [f"[LATENCY] sid={sid} utt={lat['utt_id']}"]
+    if lat["interrupted_prev"]:
+        parts.append("MODEL_INTERRUPTED")
+
+    parts.append(f"user_speech_ms={user_speech_ms}")
+    parts.append(f"TTFB_ms={ttfb_ms}")
+    parts.append(f"model_speech_ms={model_speech_ms}")
+    parts.append(f"e2e_to_end_ms={e2e_to_end_ms}")
+
+    logging.info(" ".join(parts))
+
+def reset_for_next_turn(lat):
+    """Resetea banderas para un nuevo turno (sin perder contador)."""
+    lat["user_in_speech"] = False
+    lat["user_start_ts"] = None
+    lat["user_end_ts"] = None
+    lat["last_voice_ts"] = None
+    lat["awaiting_model"] = False
+    lat["model_first_audio_ts"] = None
+    lat["model_end_ts"] = None
+    lat["model_in_progress"] = False
+    lat["interrupted_prev"] = False
+
+# ------------------------
+# Telnyx helper
+# ------------------------
 def api(call_id: str, action: str, data: dict = None):
     try:
         resp = requests.post(
@@ -45,9 +157,12 @@ def api(call_id: str, action: str, data: dict = None):
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         return resp
     except Exception as ex:
-        print(f"Excepción al enviar comando '{action}': {str(ex)}")
+        logging.exception(f"Excepción al enviar comando '{action}': {str(ex)}")
         raise
 
+# ------------------------
+# Webhook Telnyx
+# ------------------------
 @app.post("/telnyx-webhook")
 async def telnyx_webhook(request: Request):
     data = await request.json()
@@ -60,38 +175,41 @@ async def telnyx_webhook(request: Request):
     if e["event_type"] == "call.initiated":
         if direction == "incoming":
             try:
-                # Inicializar sesión (codec se setea en WS start)
                 sessions[sid] = {
                     "codec": None,
                     "raw_bytes": b"",
                     "wavefile": None,
                     "filename": f"llamadas_guardadas/inbound_call_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav",
-                    "openai_ws": None,
+                    "gemini_ws": None,
                     "telnyx_ws": None,
                     "audio_buffer_out": b"",
-                    "output_pcm": b""  # Para depuración: acumular PCM 8kHz antes de codificar
+                    "output_pcm": b"",
+                    "latency": init_latency_tracker()
                 }
-
                 state = base64.b64encode(b"init").decode()
                 answer_data = {
                     "client_state": state,
                     "stream_url": STREAM_URL,
                     "stream_track": "both_tracks",
                     "stream_bidirectional_mode": "rtp",
-                    "stream_bidirectional_codec": "PCMA"  # Cambiado a PCMA para coincidir con el codec detectado en tus logs
+                    "stream_bidirectional_codec": "PCMA"
                 }
                 api(cid, "answer", answer_data)
+                logging.info(f"[Webhook] call.initiated incoming sid={sid}")
             except Exception as ex:
-                print(f"Error al contestar llamada: {str(ex)}")
-
+                logging.exception(f"Error al contestar llamada: {str(ex)}")
 
     elif e["event_type"] == "call.hangup":
+        logging.info(f"[Webhook] call.hangup sid={sid}")
         if sid in sessions:
             await close_session(sid)
             del sessions[sid]
 
     return {"status": "OK"}
 
+# ------------------------
+# Click-to-call (outbound)
+# ------------------------
 @app.post("/make_outbound_call")
 async def make_outbound_call(request: Request):
     body = await request.json()
@@ -108,7 +226,7 @@ async def make_outbound_call(request: Request):
             "stream_url": STREAM_URL,
             "stream_track": "both_tracks",
             "stream_bidirectional_mode": "rtp",
-            "stream_bidirectional_codec": "PCMA"  # Cambiado a PCMA
+            "stream_bidirectional_codec": "PCMA"
         }
         resp = requests.post(
             "https://api.telnyx.com/v2/calls",
@@ -128,17 +246,21 @@ async def make_outbound_call(request: Request):
             "raw_bytes": b"",
             "wavefile": None,
             "filename": f"llamadas_guardadas/outbound_call_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav",
-            "openai_ws": None,
+            "gemini_ws": None,
             "telnyx_ws": None,
             "audio_buffer_out": b"",
-            "output_pcm": b""
+            "output_pcm": b"",
+            "latency": init_latency_tracker()
         }
-        
+        logging.info(f"[make_outbound_call] sid={sid} -> {to_number}")
         return {"status": "Llamada outbound iniciada", "details": resp.json()}
     except Exception as ex:
-        print(f"Excepción en outbound: {str(ex)}")
+        logging.exception(f"Excepción en outbound: {str(ex)}")
         raise
 
+# ------------------------
+# Cierre de sesión / guardado de audios
+# ------------------------
 async def close_session(sid):
     if sid not in sessions:
         return
@@ -146,11 +268,12 @@ async def close_session(sid):
     codec = sess["codec"]
     filename = sess["filename"]
 
+    # Cierra wavefile si corresponde
     if codec in ["PCMU", "PCMA"]:
         if sess["wavefile"]:
             sess["wavefile"].close()
     else:
-        # Para OPUS/G722, guardar raw y convertir con pydub
+        # Convertir otros codecs a WAV si guardaste raw_bytes
         if sess["raw_bytes"]:
             ext = "opus" if codec == "OPUS" else "g722" if codec == "G722" else "raw"
             temp_path = f"temp_{sid}.{ext}"
@@ -159,13 +282,16 @@ async def close_session(sid):
             audio = AudioSegment.from_file(temp_path, format=ext)
             audio.export(filename, format="wav")
             os.remove(temp_path)
-            print(f"Grabación convertida y guardada en {filename}")
+            logging.info(f"Grabación convertida y guardada en {filename}")
 
-    # Cerrar conexión OpenAI si existe
-    if sess["openai_ws"]:
-        await sess["openai_ws"].close()
+    # Cierra WS Gemini
+    if sess["gemini_ws"]:
+        try:
+            await sess["gemini_ws"].close()
+        except Exception:
+            pass
 
-    # Para depuración: Guardar audio de salida como WAV
+    # Guarda el audio de salida de Gemini
     if sess["output_pcm"]:
         output_filename = f"llamadas_guardadas/output_audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
         wf = wave.open(output_filename, "wb")
@@ -174,32 +300,61 @@ async def close_session(sid):
         wf.setframerate(8000)
         wf.writeframes(sess["output_pcm"])
         wf.close()
-        print(f"Audio de salida de OpenAI guardado en {output_filename} para depuración")
+        logging.info(f"Audio de salida de Gemini guardado en {output_filename}")
 
-async def receive_from_openai(sid):
+# ------------------------
+# Recepción desde Gemini (outbound hacia Telnyx)
+# ------------------------
+async def receive_from_gemini(sid):
     sess = sessions[sid]
-    openai_ws = sess["openai_ws"]
+    gemini_ws = sess["gemini_ws"]
     telnyx_ws = sess["telnyx_ws"]
     codec = sess["codec"]
-    try:
-        async for message in openai_ws:
-            data = json.loads(message)
-            event_type = data.get("type")
-            print(f"Evento recibido de OpenAI: {json.dumps(data)}")  # Depuración detallada
+    lat = sess["latency"]
 
-            if event_type == "response.audio.delta":
-                audio_delta = base64.b64decode(data.get("delta", ""))
-                print(f"Recibido audio delta de longitud: {len(audio_delta)}")  # Depuración
+    try:
+        async for message in gemini_ws:
+            data = json.loads(message)
+
+            # 1) Interrupción del modelo (usuario habló encima)
+            try:
+                interrupted = data["serverContent"]["interrupted"]
+                if interrupted:
+                    # si estaba respondiendo, marcamos turno previo como interrumpido y lo logeamos ya mismo
+                    if lat["model_in_progress"]:
+                        lat["interrupted_prev"] = True
+                        lat["model_end_ts"] = now_monotonic()
+                        log_turn_metrics(sid, lat)
+                        # no reseteamos utt_id (se mantiene); el próximo audio del usuario abrirá otro turno
+                        lat["model_in_progress"] = False
+                        lat["awaiting_model"] = False
+                        lat["model_first_audio_ts"] = None
+                # limpiamos buffer de salida para evitar eco parcial
+                sess["audio_buffer_out"] = b""
+            except KeyError:
+                pass
+
+            # 2) Llega audio del modelo (primer chunk => medir TTFB)
+            try:
+                audio_b64 = data["serverContent"]["modelTurn"]["parts"][0]["inlineData"]["data"]
+                audio_delta = base64.b64decode(audio_b64)
                 if audio_delta:
-                    # Acumular audio de salida (PCM16 24kHz)
+                    # Si estábamos esperando la respuesta del modelo para este turno, medimos TTFB
+                    if lat["awaiting_model"] and not lat["model_in_progress"]:
+                        lat["model_first_audio_ts"] = now_monotonic()
+                        lat["model_in_progress"] = True
+                        lat["awaiting_model"] = False
+                        logging.debug(f"[Gemini] first audio sid={sid} utt={lat['utt_id']} TTFB_ms={ms(lat['model_first_audio_ts'] - lat['user_end_ts']) if lat['user_end_ts'] else None}")
+
                     sess["audio_buffer_out"] += audio_delta
-                    # Procesar en chunks de 20ms para coincidir con ptime de Telnyx
-                    chunk_size = 960  # 24000 Hz * 2 bytes * 0.02 s
+
+                    # Salida de Gemini llega a 24k PCM16
+                    chunk_size = 960  # 20 ms @ 24kHz mono 16-bit -> 24_000 * 0.02 * 2 = 960
                     while len(sess["audio_buffer_out"]) >= chunk_size:
                         pcm24k = sess["audio_buffer_out"][:chunk_size]
                         sess["audio_buffer_out"] = sess["audio_buffer_out"][chunk_size:]
 
-                        # Low-pass filter antes de resample (orden 4, padlen ~14)
+                        # Filtro y downsample a 8k para Telnyx
                         b, a = signal.butter(4, 3900 / (24000 / 2), btype='low')
                         pcm24k_np = np.frombuffer(pcm24k, dtype=np.int16).astype(np.float32)
                         if len(pcm24k_np) > 14:
@@ -208,25 +363,18 @@ async def receive_from_openai(sid):
                             filtered_np = pcm24k_np
                         pcm24k_filtered = filtered_np.astype(np.int16)
 
-                        # Resample a 8kHz
                         pcm8k_np = signal.resample(pcm24k_filtered, int(len(pcm24k_filtered) * 8000 / 24000))
                         pcm8k = pcm8k_np.astype(np.int16).tobytes()
 
-                        # Acumular para guardar WAV de depuración
                         sess["output_pcm"] += pcm8k
 
-                        # Codificar según el codec detectado
                         if codec == "PCMA":
                             encoded_bytes = audioop.lin2alaw(pcm8k, 2)
                         elif codec == "PCMU":
                             encoded_bytes = audioop.lin2ulaw(pcm8k, 2)
                         else:
-                            print(f"Codec no soportado para salida: {codec}")
                             continue
 
-                        print(f"Enviando chunk codificado de longitud: {len(encoded_bytes)}")  # Depuración
-
-                        # Enviar a Telnyx
                         media_event = {
                             "event": "media",
                             "media": {
@@ -235,53 +383,36 @@ async def receive_from_openai(sid):
                             }
                         }
                         await telnyx_ws.send_text(json.dumps(media_event))
-                        print("Enviado chunk de audio a Telnyx")  # Para depuración
+            except KeyError:
+                pass
 
-            elif event_type == "response.audio.done":
-                # Enviar cualquier buffer restante
-                if sess["audio_buffer_out"]:
-                    pcm24k = sess["audio_buffer_out"]
-                    sess["audio_buffer_out"] = b""
-                    b, a = signal.butter(4, 3900 / (24000 / 2), btype='low')
-                    pcm24k_np = np.frombuffer(pcm24k, dtype=np.int16).astype(np.float32)
-                    if len(pcm24k_np) > 14:
-                        filtered_np = signal.filtfilt(b, a, pcm24k_np)
-                    else:
-                        filtered_np = pcm24k_np
-                    pcm24k_filtered = filtered_np.astype(np.int16)
-                    pcm8k_np = signal.resample(pcm24k_filtered, int(len(pcm24k_filtered) * 8000 / 24000))
-                    pcm8k = pcm8k_np.astype(np.int16).tobytes()
-                    sess["output_pcm"] += pcm8k
-                    if codec == "PCMA":
-                        encoded_bytes = audioop.lin2alaw(pcm8k, 2)
-                    elif codec == "PCMU":
-                        encoded_bytes = audioop.lin2ulaw(pcm8k, 2)
-                    else:
-                        print(f"Codec no soportado para salida: {codec}")
-                        return
-                    print(f"Enviando buffer restante codificado de longitud: {len(encoded_bytes)}")  # Depuración
-                    media_event = {
-                        "event": "media",
-                        "media": {
-                            "payload": base64.b64encode(encoded_bytes).decode(),
-                            "track": "outbound"
-                        }
-                    }
-                    await telnyx_ws.send_text(json.dumps(media_event))
-                    print("Enviado buffer restante de audio a Telnyx")  # Para depuración
-
-            # Manejar otros eventos si es necesario, como transcripciones o texto
-            if event_type in ["response.audio_transcript.delta", "response.content_part.done", "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped"]:
-                print(f"Evento OpenAI específico: {json.dumps(data)}")  # Más depuración
+            # 3) Fin del turno del modelo => cerramos métricas y log
+            try:
+                turn_complete = data["serverContent"]["turnComplete"]
+                if turn_complete:
+                    lat["model_end_ts"] = now_monotonic()
+                    log_turn_metrics(sid, lat)
+                    # preparamos para el siguiente turno (utt_id se mantiene, se incrementa cuando el usuario vuelve a hablar)
+                    lat["model_in_progress"] = False
+                    lat["awaiting_model"] = False
+                    lat["model_first_audio_ts"] = None
+                    lat["model_end_ts"] = None
+                    lat["interrupted_prev"] = False
+            except KeyError:
+                pass
 
     except Exception as ex:
-        print(f"Error recibiendo de OpenAI: {str(ex)}")
+        logging.exception(f"Error recibiendo de Gemini: {str(ex)}")
 
+# ------------------------
+# WebSocket bidireccional con Telnyx
+# ------------------------
 @app.websocket("/media")
 async def handle_media_stream(websocket: WebSocket):
     await websocket.accept()
     sid = None
-    openai_task = None
+    gemini_task = None
+
     try:
         while True:
             msg = await websocket.receive_text()
@@ -295,83 +426,111 @@ async def handle_media_stream(websocket: WebSocket):
                 if sid in sessions:
                     sessions[sid]["codec"] = codec
                     sessions[sid]["telnyx_ws"] = websocket
-                    print(f"Codec detectado: {codec}")  # Para depuración
                     if codec in ["PCMU", "PCMA"]:
-                        # Para narrowband, inicializar WAV a 8kHz
                         wf = wave.open(sessions[sid]["filename"], "wb")
                         wf.setnchannels(1)
                         wf.setsampwidth(2)
                         wf.setframerate(8000)
                         sessions[sid]["wavefile"] = wf
-                    # Para wideband, usamos raw_bytes y convertimos al final (pydub maneja rates más altos)
 
-                    # Conectar a OpenAI Realtime API
-                    url = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17"
-                    headers = {
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "OpenAI-Beta": "realtime=v1"
-                    }
+                    # Conectar a Gemini Realtime API
+                    uri = (
+                        "wss://generativelanguage.googleapis.com/ws/"
+                        "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+                        f"?key={GEMINI_API_KEY}"
+                    )
                     try:
-                        openai_ws = await websockets.connect(url, extra_headers=headers)
-                        sessions[sid]["openai_ws"] = openai_ws
-                        print("Conectado exitosamente a OpenAI Realtime API")  # Depuración
+                        gemini_ws = await websockets.connect(uri, max_size=None)
+                        sessions[sid]["gemini_ws"] = gemini_ws
+                        logging.info(f"[WS] Gemini conectado sid={sid}")
                     except Exception as ex:
-                        print(f"Error conectando a OpenAI: {str(ex)}")
+                        logging.exception(f"Error conectando a Gemini: {str(ex)}")
                         continue
 
-                    # Configurar sesión en OpenAI con VAD thresholds
-                    session_event = {
-                        "type": "session.update",
-                        "session": {
-                            "modalities": ["text", "audio"],
-                            "instructions": "Eres un asistente útil. Responde en español ya que el usuario habla en español.",
-                            "voice": "alloy",
-                            "input_audio_format": "pcm16",
-                            "output_audio_format": "pcm16",
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": 0.8,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": 200
+                    # Configurar sesión en Gemini (AAD activado con defaults seguros)
+                    system_prompt = (
+                        NATIVE_SYSTEM_PROMPT
+                        + f"\nCuando el usuario diga '___start___', responde exactamente: '{GEMINI_ASSISTANT_GREETING}' y espera su consulta."
+                    )
+                    setup_event = {
+                        "setup": {
+                            "model": GEMINI_MODEL,
+                            "generationConfig": {
+                                "responseModalities": ["AUDIO"],
+                                "speechConfig": {
+                                    "voiceConfig": {
+                                        "prebuiltVoiceConfig": {"voiceName": "Puck"}
+                                    }
+                                }
                             },
-                            "temperature": 0.8,
+                            "systemInstruction": {"parts": [{"text": system_prompt}]},
+                            "realtimeInputConfig": {
+                                "automaticActivityDetection": {
+                                    "disabled": False
+                                }
+                            }
                         }
                     }
-                    await openai_ws.send(json.dumps(session_event))
-                    print("Enviada configuración de sesión a OpenAI")  # Depuración
+                    await gemini_ws.send(json.dumps(setup_event))
+                    await gemini_ws.recv()  # Esperar ACK
 
-                    # Para que el agente hable primero, crear una respuesta inicial
-                    initial_response = {
-                        "type": "response.create",
-                        "response": {
-                            "modalities": ["text", "audio"],
-                            "instructions": "Saluda al usuario en español y pregúntale cómo puedes ayudarle hoy."
-                        }
-                    }
-                    await openai_ws.send(json.dumps(initial_response))
-                    print("Enviada solicitud de respuesta inicial a OpenAI")  # Depuración
+                    # Trigger saludo inicial
+                    initial_input = {"realtime_input": {"text": "___start___"}}
+                    await gemini_ws.send(json.dumps(initial_input))
 
-                    # Iniciar tarea para recibir de OpenAI
-                    openai_task = asyncio.create_task(receive_from_openai(sid))
+                    # Iniciar tarea de recepción de Gemini
+                    gemini_task = asyncio.create_task(receive_from_gemini(sid))
+                    logging.info(f"[Telnyx WS] start sid={sid} codec={codec}")
 
             elif evt == "media" and sid in sessions:
                 media_info = data.get("media", {})
                 track = media_info.get("track")
                 payload = media_info.get("payload")
                 if not payload or track != "inbound":
-                    continue  # Ignorar outbound por ahora
+                    continue
 
                 raw = base64.b64decode(payload)
                 sess = sessions[sid]
                 codec = sess["codec"]
-                openai_ws = sess["openai_ws"]
+                gemini_ws = sess["gemini_ws"]
+                lat = sess["latency"]
 
                 if codec in ["PCMU", "PCMA"]:
                     if codec == "PCMA":
-                        pcm = audioop.alaw2lin(raw, 2)
-                    elif codec == "PCMU":
+                        pcm = audioop.alaw2lin(raw, 2)   # 8k mono 16-bit
+                    else:
                         pcm = audioop.ulaw2lin(raw, 2)
-                    # Low-pass filter antes de resample
+
+                    # --------------------
+                    # VAD: detección de inicio/fin de habla
+                    # --------------------
+                    rms = audioop.rms(pcm, 2)  # energía
+                    now = now_monotonic()
+
+                    if rms >= VAD_RMS_THRESHOLD:
+                        # Inicio de habla
+                        if not lat["user_in_speech"]:
+                            lat["utt_id"] += 1
+                            lat["user_in_speech"] = True
+                            lat["user_start_ts"] = now
+                            lat["user_end_ts"] = None
+                            lat["awaiting_model"] = False
+                            lat["model_first_audio_ts"] = None
+                            lat["model_end_ts"] = None
+                            lat["model_in_progress"] = False
+                            lat["interrupted_prev"] = False
+                            logging.debug(f"[VAD] USER_START sid={sid} utt={lat['utt_id']}")
+                        lat["last_voice_ts"] = now
+                    else:
+                        # Posible fin de habla si hay silencio continuo
+                        if lat["user_in_speech"] and lat["last_voice_ts"]:
+                            if (now - lat["last_voice_ts"]) * 1000.0 >= VAD_SILENCE_MS:
+                                lat["user_in_speech"] = False
+                                lat["user_end_ts"] = lat["last_voice_ts"]
+                                lat["awaiting_model"] = True   # ahora esperamos la 1ª respuesta del modelo
+                                logging.debug(f"[VAD] USER_END sid={sid} utt={lat['utt_id']} user_speech_ms={ms(lat['user_end_ts'] - lat['user_start_ts'])}")
+
+                    # Low-pass + resample a 16k para Gemini
                     pcm8k_np = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
                     b, a = signal.butter(4, 3900 / (8000 / 2), btype='low')
                     if len(pcm8k_np) > 14:
@@ -379,37 +538,47 @@ async def handle_media_stream(websocket: WebSocket):
                     else:
                         filtered_np = pcm8k_np
                     pcm8k_filtered = filtered_np.astype(np.int16)
-                    pcm24k_np = signal.resample(pcm8k_filtered, int(len(pcm8k_filtered) * 24000 / 8000))
-                    pcm24k = pcm24k_np.astype(np.int16).tobytes()
+                    pcm16k_np = signal.resample(pcm8k_filtered, int(len(pcm8k_filtered) * 16000 / 8000))
+                    pcm16k = pcm16k_np.astype(np.int16).tobytes()
 
-                    # Enviar a OpenAI
-                    if openai_ws:
+                    # Enviar a Gemini
+                    if gemini_ws:
                         append_event = {
-                            "type": "input_audio_buffer.append",
-                            "audio": base64.b64encode(pcm24k).decode()
+                            "realtime_input": {
+                                "audio": {
+                                    "data": base64.b64encode(pcm16k).decode(),
+                                    "mime_type": "audio/pcm;rate=16000"
+                                }
+                            }
                         }
-                        await openai_ws.send(json.dumps(append_event))
-                        print("Enviado audio inbound a OpenAI")  # Depuración
+                        await gemini_ws.send(json.dumps(append_event))
 
-                    # Continuar grabando
-                    sess["wavefile"].writeframes(pcm)
+                    # Guardar grabación inbound
+                    if sess["wavefile"]:
+                        sess["wavefile"].writeframes(pcm)
+
                 else:
-                    # Para OPUS/G722, acumular raw bytes (lógica de grabación original)
+                    # Otros codecs: acumula raw (no usado aquí)
                     sess["raw_bytes"] += raw
-                    # Para integración con OpenAI, se requeriría decodificar OPUS/G722 a PCM y resamplear.
-                    # Esto requiere librerías adicionales como pyopus o usar pydub en chunks con BytesIO.
-                    # Por simplicidad, usamos PCMU/PCMA. Si se necesita OPUS, agregar decodificación aquí.
 
             elif evt == "stop":
+                logging.info(f"[Telnyx WS] stop sid={sid}")
                 if sid in sessions:
                     await close_session(sid)
                 break
-    except Exception as ex:
-        print(f"Error en WebSocket: {str(ex)}")
-    finally:
-        if openai_task:
-            openai_task.cancel()
-        await websocket.close()
 
+    except Exception as ex:
+        logging.exception(f"Error en WebSocket: {str(ex)}")
+    finally:
+        if gemini_task:
+            gemini_task.cancel()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+# ------------------------
+# Main
+# ------------------------
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True)
