@@ -1,38 +1,60 @@
-# app.py
-# FastAPI + Telnyx Call Control + Gemini Realtime (SIN guardar audios, SIN SciPy)
-# Requisitos: fastapi, uvicorn[standard], websockets, requests, numpy, python-dotenv
+"""
+app.py — FastAPI + Telnyx Call Control + Asistente de Voz con Gemini con métricas de latencia
+REQUISITOS DE ENTORNO (.env):
+  TELNYX_API_KEY=...
+  TELNYX_CONNECTION_ID=cc-app-xxxxxxxxxxxxxxxxxxxx
+  TELNYX_FROM_NUMBER=+1XXXXXXXXXX
+  GEMINI_API_KEY=...
+  BASE_URL=https://tu-dominio
+  # Config para Gemini:
+  GEMINI_MODEL=gemini-2.5-flash-preview-native-audio-dialog
+  GEMINI_ASSISTANT_GREETING=¡Hola! ¿En qué puedo ayudarte?
+  NATIVE_SYSTEM_PROMPT=Eres un agente de soporte...
+  # (Opcional) Ajustes VAD y logging
+  VAD_RMS_THRESHOLD=500
+  VAD_SILENCE_MS=500
+  LOG_LEVEL=INFO
 
-import os
-import json
+EJECUCIÓN:
+  uvicorn app:app --host 0.0.0.0 --port 5000 --reload
+
+WEBHOOK:
+  POST https://TU-DOMINIO/telnyx-webhook
+
+Notas: pip install fastapi uvicorn websockets python-dotenv requests numpy scipy
+"""
+
 import base64
-import time
-import logging
-from datetime import datetime
-
+import json
 import requests
-import numpy as np
 import audioop
+import os
 import asyncio
 import websockets
+import numpy as np
+import scipy.signal as signal
+import time
+import logging
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket
+import uvicorn
 from dotenv import load_dotenv
 
 # ------------------------
 # Config & logging
 # ------------------------
 load_dotenv()
-
 TELNYX_API_KEY = os.getenv("TELNYX_API_KEY")
 TELNYX_CONNECTION_ID = os.getenv("TELNYX_CONNECTION_ID")
 TELNYX_FROM_NUMBER = os.getenv("TELNYX_FROM_NUMBER")
-BASE_URL = os.getenv("BASE_URL")  # https://tu-dominio
+BASE_URL = os.getenv("BASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-native-audio-dialog")
 GEMINI_ASSISTANT_GREETING = os.getenv("GEMINI_ASSISTANT_GREETING", "¡Hola! ¿En qué puedo ayudarte?")
 NATIVE_SYSTEM_PROMPT = os.getenv("NATIVE_SYSTEM_PROMPT", "Eres un agente de soporte útil. Responde en español.")
-VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "500"))
-VAD_SILENCE_MS = int(os.getenv("VAD_SILENCE_MS", "500"))
+
+VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "500"))   # Umbral de energía (ajústalo a tu audio real)
+VAD_SILENCE_MS = int(os.getenv("VAD_SILENCE_MS", "500"))         # ms de silencio para marcar fin de habla
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
@@ -40,57 +62,21 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# No abortar al arrancar si faltan ENV; solo avisar.
-missing = [k for k, v in {
-    "BASE_URL": BASE_URL,
-    "GEMINI_API_KEY": GEMINI_API_KEY,
-}.items() if not v]
-if missing:
-    logging.warning(f"Faltan variables de entorno: {missing}. La app arranca igual, "
-                    "pero fallará al usarlas.")
+if not BASE_URL:
+    raise ValueError("BASE_URL no está configurado en las variables de entorno")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY no está configurado en las variables de entorno")
 
-def get_stream_url() -> str:
-    """Convierte BASE_URL https -> wss para el websocket /media."""
-    if not BASE_URL or not BASE_URL.startswith("https://"):
-        raise HTTPException(status_code=500, detail="BASE_URL debe ser https://... (ej. https://mi-dominio)")
-    return BASE_URL.replace("https://", "wss://") + "/media"
+STREAM_URL = BASE_URL.replace("https://", "wss://") + "/media"
 
+app = FastAPI()
+sessions = {}
 
 # ------------------------
-# Utilidades de audio (sin SciPy)
-# ------------------------
-def downsample_24k_to_8k(pcm24_bytes: bytes) -> bytes:
-    """Baja de 24 kHz a 8 kHz por decimación x3 (simple y rápido)."""
-    x = np.frombuffer(pcm24_bytes, dtype=np.int16)
-    if x.size == 0:
-        return b""
-    y = x[::3]  # toma 1 de cada 3 muestras
-    return y.astype(np.int16).tobytes()
-
-def upsample_8k_to_16k_linear(pcm8_bytes: bytes) -> bytes:
-    """Sube de 8 kHz a 16 kHz por interpolación lineal x2."""
-    x = np.frombuffer(pcm8_bytes, dtype=np.int16)
-    n = x.size
-    if n == 0:
-        return b""
-    if n == 1:
-        # duplica la única muestra
-        y = np.repeat(x, 2)
-        return y.astype(np.int16).tobytes()
-
-    y = np.empty(n * 2, dtype=np.int16)
-    y[0::2] = x  # índices pares = originales
-    # índices impares = promedio de vecinos
-    mid = (x[:-1].astype(np.int32) + x[1:].astype(np.int32)) // 2
-    y[1:-1:2] = mid.astype(np.int16)
-    y[-1] = x[-1]  # último impar replica el último valor
-    return y.tobytes()
-
-
-# ------------------------
-# Latencia helpers
+# Utilidades Latencia
 # ------------------------
 def now_monotonic():
+    """Reloj monotónico en segundos para medir intervalos con precisión."""
     return time.perf_counter()
 
 def ms(dt):
@@ -98,19 +84,20 @@ def ms(dt):
 
 def init_latency_tracker():
     return {
-        "utt_id": 0,
-        "user_in_speech": False,
-        "user_start_ts": None,
-        "user_end_ts": None,
-        "last_voice_ts": None,
-        "awaiting_model": False,
-        "model_first_audio_ts": None,
-        "model_end_ts": None,
-        "model_in_progress": False,
-        "interrupted_prev": False
+        "utt_id": 0,                 # contador de turnos (cada vez que el usuario habla)
+        "user_in_speech": False,     # estamos dentro de voz activa del usuario
+        "user_start_ts": None,       # inicio de habla
+        "user_end_ts": None,         # fin de habla (por silencio)
+        "last_voice_ts": None,       # última vez que detectamos energía > umbral
+        "awaiting_model": False,     # esperamos primera respuesta del modelo para este turno
+        "model_first_audio_ts": None,# primer chunk de audio del modelo para este turno
+        "model_end_ts": None,        # fin de la respuesta del modelo (turnComplete)
+        "model_in_progress": False,  # modelo está respondiendo
+        "interrupted_prev": False    # si el modelo anterior fue interrumpido por habla del usuario
     }
 
 def log_turn_metrics(sid, lat):
+    """Log de métricas cuando termina un turno del modelo, si hay datos suficientes."""
     if lat["user_start_ts"] and lat["user_end_ts"]:
         user_speech_ms = ms(lat["user_end_ts"] - lat["user_start_ts"])
     else:
@@ -134,26 +121,30 @@ def log_turn_metrics(sid, lat):
     parts = [f"[LATENCY] sid={sid} utt={lat['utt_id']}"]
     if lat["interrupted_prev"]:
         parts.append("MODEL_INTERRUPTED")
-    parts += [
-        f"user_speech_ms={user_speech_ms}",
-        f"TTFB_ms={ttfb_ms}",
-        f"model_speech_ms={model_speech_ms}",
-        f"e2e_to_end_ms={e2e_to_end_ms}",
-    ]
+
+    parts.append(f"user_speech_ms={user_speech_ms}")
+    parts.append(f"TTFB_ms={ttfb_ms}")
+    parts.append(f"model_speech_ms={model_speech_ms}")
+    parts.append(f"e2e_to_end_ms={e2e_to_end_ms}")
+
     logging.info(" ".join(parts))
 
+def reset_for_next_turn(lat):
+    """Resetea banderas para un nuevo turno (sin perder contador)."""
+    lat["user_in_speech"] = False
+    lat["user_start_ts"] = None
+    lat["user_end_ts"] = None
+    lat["last_voice_ts"] = None
+    lat["awaiting_model"] = False
+    lat["model_first_audio_ts"] = None
+    lat["model_end_ts"] = None
+    lat["model_in_progress"] = False
+    lat["interrupted_prev"] = False
 
 # ------------------------
-# App & estado en memoria
+# Telnyx helper
 # ------------------------
-app = FastAPI()
-sessions = {}  # sid -> {codec, gemini_ws, telnyx_ws, audio_buffer_out, latency}
-
-
-# ------------------------
-# Telnyx helpers
-# ------------------------
-def telnyx_action(call_id: str, action: str, data: dict = None):
+def api(call_id: str, action: str, data: dict = None):
     try:
         resp = requests.post(
             f"https://api.telnyx.com/v2/calls/{call_id}/actions/{action}",
@@ -166,15 +157,6 @@ def telnyx_action(call_id: str, action: str, data: dict = None):
     except Exception as ex:
         logging.exception(f"Excepción al enviar comando '{action}': {str(ex)}")
         raise
-
-
-# ------------------------
-# Healthcheck
-# ------------------------
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "time": datetime.utcnow().isoformat()}
-
 
 # ------------------------
 # Webhook Telnyx
@@ -196,17 +178,17 @@ async def telnyx_webhook(request: Request):
                     "gemini_ws": None,
                     "telnyx_ws": None,
                     "audio_buffer_out": b"",
-                    "latency": init_latency_tracker(),
+                    "latency": init_latency_tracker()
                 }
                 state = base64.b64encode(b"init").decode()
                 answer_data = {
                     "client_state": state,
-                    "stream_url": get_stream_url(),
+                    "stream_url": STREAM_URL,
                     "stream_track": "both_tracks",
                     "stream_bidirectional_mode": "rtp",
                     "stream_bidirectional_codec": "PCMA"
                 }
-                telnyx_action(cid, "answer", answer_data)
+                api(cid, "answer", answer_data)
                 logging.info(f"[Webhook] call.initiated incoming sid={sid}")
             except Exception as ex:
                 logging.exception(f"Error al contestar llamada: {str(ex)}")
@@ -215,10 +197,9 @@ async def telnyx_webhook(request: Request):
         logging.info(f"[Webhook] call.hangup sid={sid}")
         if sid in sessions:
             await close_session(sid)
-            sessions.pop(sid, None)
+            del sessions[sid]
 
     return {"status": "OK"}
-
 
 # ------------------------
 # Click-to-call (outbound)
@@ -236,7 +217,7 @@ async def make_outbound_call(request: Request):
             "to": to_number,
             "from": TELNYX_FROM_NUMBER,
             "client_state": state,
-            "stream_url": get_stream_url(),
+            "stream_url": STREAM_URL,
             "stream_track": "both_tracks",
             "stream_bidirectional_mode": "rtp",
             "stream_bidirectional_codec": "PCMA"
@@ -248,18 +229,18 @@ async def make_outbound_call(request: Request):
         )
         if not resp.ok:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
+        
         resp_data = resp.json()["data"]
         sid = resp_data.get("call_session_id")
         if not sid:
             raise HTTPException(status_code=500, detail="No se obtuvo call_session_id")
-
+        
         sessions[sid] = {
             "codec": None,
             "gemini_ws": None,
             "telnyx_ws": None,
             "audio_buffer_out": b"",
-            "latency": init_latency_tracker(),
+            "latency": init_latency_tracker()
         }
         logging.info(f"[make_outbound_call] sid={sid} -> {to_number}")
         return {"status": "Llamada outbound iniciada", "details": resp.json()}
@@ -267,23 +248,23 @@ async def make_outbound_call(request: Request):
         logging.exception(f"Excepción en outbound: {str(ex)}")
         raise
 
-
 # ------------------------
-# Cierre de sesión (sin archivos)
+# Cierre de sesión (sin guardado)
 # ------------------------
 async def close_session(sid):
-    sess = sessions.get(sid)
-    if not sess:
+    if sid not in sessions:
         return
+    sess = sessions[sid]
+
+    # Cierra WS Gemini si está abierto
     if sess.get("gemini_ws"):
         try:
             await sess["gemini_ws"].close()
         except Exception:
             pass
 
-
 # ------------------------
-# Recibir desde Gemini -> enviar a Telnyx
+# Recepción desde Gemini (outbound hacia Telnyx)
 # ------------------------
 async def receive_from_gemini(sid):
     sess = sessions[sid]
@@ -296,25 +277,28 @@ async def receive_from_gemini(sid):
         async for message in gemini_ws:
             data = json.loads(message)
 
-            # 1) Interrupción
+            # 1) Interrupción del modelo (usuario habló encima)
             try:
                 interrupted = data["serverContent"]["interrupted"]
-                if interrupted and lat["model_in_progress"]:
-                    lat["interrupted_prev"] = True
-                    lat["model_end_ts"] = now_monotonic()
-                    log_turn_metrics(sid, lat)
-                    lat["model_in_progress"] = False
-                    lat["awaiting_model"] = False
-                    lat["model_first_audio_ts"] = None
-                    sess["audio_buffer_out"] = b""
+                if interrupted:
+                    if lat["model_in_progress"]:
+                        lat["interrupted_prev"] = True
+                        lat["model_end_ts"] = now_monotonic()
+                        log_turn_metrics(sid, lat)
+                        lat["model_in_progress"] = False
+                        lat["awaiting_model"] = False
+                        lat["model_first_audio_ts"] = None
+                # limpiamos buffer de salida para evitar eco parcial
+                sess["audio_buffer_out"] = b""
             except KeyError:
                 pass
 
-            # 2) Audio del modelo (24k PCM16 mono)
+            # 2) Llega audio del modelo (primer chunk => medir TTFB)
             try:
                 audio_b64 = data["serverContent"]["modelTurn"]["parts"][0]["inlineData"]["data"]
                 audio_delta = base64.b64decode(audio_b64)
                 if audio_delta:
+                    # Si estábamos esperando la respuesta del modelo para este turno, medimos TTFB
                     if lat["awaiting_model"] and not lat["model_in_progress"]:
                         lat["model_first_audio_ts"] = now_monotonic()
                         lat["model_in_progress"] = True
@@ -326,27 +310,36 @@ async def receive_from_gemini(sid):
 
                     sess["audio_buffer_out"] += audio_delta
 
-                    # Procesar en chunks de 20ms @24k (960 bytes)
-                    chunk_size = 960
+                    # Salida de Gemini llega a 24k PCM16; troceamos en ~20 ms
+                    chunk_size = 960  # 20 ms @ 24kHz mono 16-bit -> 24_000 * 0.02 * 2 = 960
                     while len(sess["audio_buffer_out"]) >= chunk_size:
                         pcm24k = sess["audio_buffer_out"][:chunk_size]
                         sess["audio_buffer_out"] = sess["audio_buffer_out"][chunk_size:]
 
-                        # Downsample 24k -> 8k (simple decimación)
-                        pcm8k = downsample_24k_to_8k(pcm24k)
-
-                        # Codificar a PCMA/PCMU para Telnyx
-                        if codec == "PCMA":
-                            encoded = audioop.lin2alaw(pcm8k, 2)
-                        elif codec == "PCMU":
-                            encoded = audioop.lin2ulaw(pcm8k, 2)
+                        # Filtro y downsample a 8k para Telnyx
+                        b, a = signal.butter(4, 3900 / (24000 / 2), btype='low')
+                        pcm24k_np = np.frombuffer(pcm24k, dtype=np.int16).astype(np.float32)
+                        if len(pcm24k_np) > 14:
+                            filtered_np = signal.filtfilt(b, a, pcm24k_np)
                         else:
+                            filtered_np = pcm24k_np
+                        pcm24k_filtered = filtered_np.astype(np.int16)
+
+                        pcm8k_np = signal.resample(pcm24k_filtered, int(len(pcm24k_filtered) * 8000 / 24000))
+                        pcm8k = pcm8k_np.astype(np.int16).tobytes()
+
+                        if codec == "PCMA":
+                            encoded_bytes = audioop.lin2alaw(pcm8k, 2)
+                        elif codec == "PCMU":
+                            encoded_bytes = audioop.lin2ulaw(pcm8k, 2)
+                        else:
+                            # Codec no soportado para envío a Telnyx
                             continue
 
                         media_event = {
                             "event": "media",
                             "media": {
-                                "payload": base64.b64encode(encoded).decode(),
+                                "payload": base64.b64encode(encoded_bytes).decode(),
                                 "track": "outbound"
                             }
                         }
@@ -354,11 +347,13 @@ async def receive_from_gemini(sid):
             except KeyError:
                 pass
 
-            # 3) Fin del turno del modelo
+            # 3) Fin del turno del modelo => cerramos métricas y log
             try:
-                if data["serverContent"]["turnComplete"]:
+                turn_complete = data["serverContent"]["turnComplete"]
+                if turn_complete:
                     lat["model_end_ts"] = now_monotonic()
                     log_turn_metrics(sid, lat)
+                    # preparamos para el siguiente turno
                     lat["model_in_progress"] = False
                     lat["awaiting_model"] = False
                     lat["model_first_audio_ts"] = None
@@ -369,7 +364,6 @@ async def receive_from_gemini(sid):
 
     except Exception as ex:
         logging.exception(f"Error recibiendo de Gemini: {str(ex)}")
-
 
 # ------------------------
 # WebSocket bidireccional con Telnyx
@@ -390,12 +384,11 @@ async def handle_media_stream(websocket: WebSocket):
                 start_info = data.get("start", {})
                 sid = start_info.get("call_session_id")
                 codec = start_info.get("media_format", {}).get("encoding")
-
                 if sid in sessions:
                     sessions[sid]["codec"] = codec
                     sessions[sid]["telnyx_ws"] = websocket
 
-                    # Conectar a Gemini
+                    # Conectar a Gemini Realtime API
                     uri = (
                         "wss://generativelanguage.googleapis.com/ws/"
                         "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
@@ -409,7 +402,7 @@ async def handle_media_stream(websocket: WebSocket):
                         logging.exception(f"Error conectando a Gemini: {str(ex)}")
                         continue
 
-                    # Setup Gemini (AAD activado)
+                    # Configurar sesión en Gemini (AAD activado con defaults seguros)
                     system_prompt = (
                         NATIVE_SYSTEM_PROMPT
                         + f"\nCuando el usuario diga '___start___', responde exactamente: '{GEMINI_ASSISTANT_GREETING}' y espera su consulta."
@@ -419,20 +412,28 @@ async def handle_media_stream(websocket: WebSocket):
                             "model": GEMINI_MODEL,
                             "generationConfig": {
                                 "responseModalities": ["AUDIO"],
-                                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Puck"}}}
+                                "speechConfig": {
+                                    "voiceConfig": {
+                                        "prebuiltVoiceConfig": {"voiceName": "Puck"}
+                                    }
+                                }
                             },
                             "systemInstruction": {"parts": [{"text": system_prompt}]},
-                            "realtimeInputConfig": {"automaticActivityDetection": {"disabled": False}}
+                            "realtimeInputConfig": {
+                                "automaticActivityDetection": {
+                                    "disabled": False
+                                }
+                            }
                         }
                     }
                     await gemini_ws.send(json.dumps(setup_event))
-                    await gemini_ws.recv()  # ACK
+                    await gemini_ws.recv()  # Esperar ACK
 
-                    # Saludo inicial
+                    # Trigger saludo inicial
                     initial_input = {"realtime_input": {"text": "___start___"}}
                     await gemini_ws.send(json.dumps(initial_input))
 
-                    # Tarea para recibir audio de Gemini
+                    # Iniciar tarea de recepción de Gemini
                     gemini_task = asyncio.create_task(receive_from_gemini(sid))
                     logging.info(f"[Telnyx WS] start sid={sid} codec={codec}")
 
@@ -450,12 +451,18 @@ async def handle_media_stream(websocket: WebSocket):
                 lat = sess["latency"]
 
                 if codec in ["PCMU", "PCMA"]:
-                    # 8 kHz mono, 16-bit PCM
-                    pcm = audioop.alaw2lin(raw, 2) if codec == "PCMA" else audioop.ulaw2lin(raw, 2)
+                    # Decodificar a PCM16 8k mono
+                    if codec == "PCMA":
+                        pcm = audioop.alaw2lin(raw, 2)   # 8k mono 16-bit
+                    else:
+                        pcm = audioop.ulaw2lin(raw, 2)
 
-                    # VAD (inicio/fin de habla)
-                    rms = audioop.rms(pcm, 2)
+                    # --------------------
+                    # VAD: detección de inicio/fin de habla
+                    # --------------------
+                    rms = audioop.rms(pcm, 2)  # energía
                     now = now_monotonic()
+
                     if rms >= VAD_RMS_THRESHOLD:
                         if not lat["user_in_speech"]:
                             lat["utt_id"] += 1
@@ -474,13 +481,24 @@ async def handle_media_stream(websocket: WebSocket):
                             if (now - lat["last_voice_ts"]) * 1000.0 >= VAD_SILENCE_MS:
                                 lat["user_in_speech"] = False
                                 lat["user_end_ts"] = lat["last_voice_ts"]
-                                lat["awaiting_model"] = True
-                                logging.debug(f"[VAD] USER_END sid={sid} utt={lat['utt_id']} "
-                                              f"user_speech_ms={ms(lat['user_end_ts'] - lat['user_start_ts'])}")
+                                lat["awaiting_model"] = True   # ahora esperamos la 1ª respuesta del modelo
+                                logging.debug(
+                                    f"[VAD] USER_END sid={sid} utt={lat['utt_id']} "
+                                    f"user_speech_ms={ms(lat['user_end_ts'] - lat['user_start_ts'])}"
+                                )
 
-                    # 8k -> 16k para Gemini (interpolación x2)
-                    pcm16k = upsample_8k_to_16k_linear(pcm)
+                    # Low-pass + resample a 16k para Gemini
+                    pcm8k_np = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+                    b, a = signal.butter(4, 3900 / (8000 / 2), btype='low')
+                    if len(pcm8k_np) > 14:
+                        filtered_np = signal.filtfilt(b, a, pcm8k_np)
+                    else:
+                        filtered_np = pcm8k_np
+                    pcm8k_filtered = filtered_np.astype(np.int16)
+                    pcm16k_np = signal.resample(pcm8k_filtered, int(len(pcm8k_filtered) * 16000 / 8000))
+                    pcm16k = pcm16k_np.astype(np.int16).tobytes()
 
+                    # Enviar a Gemini
                     if gemini_ws:
                         append_event = {
                             "realtime_input": {
@@ -492,14 +510,13 @@ async def handle_media_stream(websocket: WebSocket):
                         }
                         await gemini_ws.send(json.dumps(append_event))
                 else:
-                    # Otros codecs no manejados
-                    pass
+                    # Codec no soportado para este flujo
+                    logging.warning(f"[MEDIA] Codec no soportado inbound: {codec}")
 
             elif evt == "stop":
                 logging.info(f"[Telnyx WS] stop sid={sid}")
                 if sid in sessions:
                     await close_session(sid)
-                    sessions.pop(sid, None)
                 break
 
     except Exception as ex:
@@ -512,12 +529,8 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception:
             pass
 
-
 # ------------------------
 # Main
 # ------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    reload = os.getenv("RELOAD", "0") == "1"  # para pruebas locales
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=port, log_level="info", reload=reload)
+    uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True)
